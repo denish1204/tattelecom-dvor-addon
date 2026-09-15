@@ -38,12 +38,17 @@ def get_product_token(session_token: str, account_number: str) -> str:
     return resp.json()["token"]
 
 
-def get_live_video(session_token: str, product_token: str, cam_id: str) -> str:
+def get_live_video(
+    session_token: str, product_token: str, cam_id: str, account_number: str
+) -> str:
     url = "https://newlk.letai.ru/v3/safeyard/get-live-video"
     params = {"cam_id": cam_id, "product_token": product_token}
     headers = dict(BASE_HEADERS)
     headers["Authorization"] = f"Bearer {session_token}"
     headers["product-token"] = product_token
+    # Without a matching Referer, newlk.letai.ru answers every request with a
+    # generic HTTP 400 (same anti-bot check that broke the old rest_command).
+    headers["Referer"] = f"https://newlk.letai.ru/safe-yard/{cam_id}/{account_number}"
     resp = requests.get(url, params=params, headers=headers, timeout=15)
     resp.raise_for_status()
     return resp.json()["live"]
@@ -76,7 +81,9 @@ def run_cycle(opts: dict) -> None:
         cam_id = cam["cam_id"]
         stream_name = cam["stream_name"]
         try:
-            live_url = get_live_video(session_token, product_token, cam_id)
+            live_url = get_live_video(
+                session_token, product_token, cam_id, account_number
+            )
             push_to_go2rtc(go2rtc_url, stream_name, live_url)
             log.info(f"[{stream_name}] refreshed OK")
         except Exception as exc:  # noqa: BLE001 - log and keep going with other cameras
