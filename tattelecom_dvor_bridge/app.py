@@ -39,7 +39,11 @@ def get_product_token(session_token: str, account_number: str) -> str:
 
 
 def get_live_video(
-    session_token: str, product_token: str, cam_id: str, account_number: str
+    session_token: str,
+    product_token: str,
+    cam_id: str,
+    account_number: str,
+    cookie: str = "",
 ) -> str:
     url = "https://newlk.letai.ru/v3/safeyard/get-live-video"
     params = {"cam_id": cam_id, "product_token": product_token}
@@ -49,6 +53,13 @@ def get_live_video(
     # Without a matching Referer, newlk.letai.ru answers every request with a
     # generic HTTP 400 (same anti-bot check that broke the old rest_command).
     headers["Referer"] = f"https://newlk.letai.ru/safe-yard/{cam_id}/{account_number}"
+    if cookie:
+        # /v3/safeyard/* (unlike /v3/auth/*) started enforcing a browser
+        # cookie session on top of the Authorization header — without it,
+        # every call gets a generic HTTP 400 regardless of how correct the
+        # other headers are. Grab this from DevTools -> Network -> Cookie
+        # header of any request to newlk.letai.ru.
+        headers["Cookie"] = cookie
     resp = requests.get(url, params=params, headers=headers, timeout=15)
     if not resp.ok:
         log.error(
@@ -71,6 +82,7 @@ def run_cycle(opts: dict) -> None:
     session_token = opts["session_token"]
     account_number = opts["account_number"]
     go2rtc_url = opts["go2rtc_url"]
+    cookie = opts.get("cookie", "")
     cameras = opts.get("cameras", [])
 
     if not session_token or not account_number:
@@ -89,7 +101,7 @@ def run_cycle(opts: dict) -> None:
         stream_name = cam["stream_name"]
         try:
             live_url = get_live_video(
-                session_token, product_token, cam_id, account_number
+                session_token, product_token, cam_id, account_number, cookie
             )
             push_to_go2rtc(go2rtc_url, stream_name, live_url)
             log.info(f"[{stream_name}] refreshed OK")
