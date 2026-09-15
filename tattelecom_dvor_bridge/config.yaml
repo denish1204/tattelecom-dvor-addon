@@ -2,7 +2,7 @@ name: "Tattelecom Dvor Bridge"
 version: "0.1.3"
 slug: "tattelecom_dvor_bridge"
 description: "Обновляет ссылки на live-потоки камер Tattelecom «Безопасный двор» (newlk.letai.ru) и пушит их в go2rtc, чтобы HA/Frigate всегда получали рабочий стрим"
-url: "https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME"
+url: "https://github.com/denish1204/tattelecom-dvor-addon"
 arch:
   - amd64
   - aarch64
@@ -15,13 +15,14 @@ boot: manual
 options:
   session_token: ""
   account_number: ""
+  cookie: ""
   refresh_interval_minutes: 15
   go2rtc_url: "http://172.30.33.7:1984"
-  cookie: ""
   cameras: []
 schema:
   session_token: str
   account_number: str
+  cookie: str
   refresh_interval_minutes: int(1,1440)
   go2rtc_url: url
   cameras:
