@@ -50,6 +50,13 @@ def get_live_video(
     # generic HTTP 400 (same anti-bot check that broke the old rest_command).
     headers["Referer"] = f"https://newlk.letai.ru/safe-yard/{cam_id}/{account_number}"
     resp = requests.get(url, params=params, headers=headers, timeout=15)
+    if not resp.ok:
+        log.error(
+            f"get-live-video {resp.status_code} body={resp.text[:500]!r} "
+            f"referer={headers['Referer']!r} "
+            f"auth_len={len(headers['Authorization'])} "
+            f"product_token_len={len(product_token)}"
+        )
     resp.raise_for_status()
     return resp.json()["live"]
 
