@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Tattelecom Dvor Bridge — держит live-потоки камер «Безопасный двор»
-(newlk.letai.ru) живыми в go2rtc, перевыпуская ссылки по расписанию.
+(newlk.letai.ru) живыми в go2rtc.
 
-История багов API Tattelecom (почему тут столько «обвязки»):
-- 2026-10: get-live-video стал требовать ДВА РАЗНЫХ одноразовых product-токена
-  (URL ?product_token= ≠ заголовок product-token:). Один в оба → 400 «Отсутствует
-  токен авторизации».
-- 2026-11-10: get-live-video стал требовать COOKIE (token=<session_token>;
-  tokenDevice=…). Без cookie → 400 «Что-то пошло не так…».
-- 2026-11-13: API стал требовать заголовок `Version: 300`. Без него → 400
-  «…попробуйте через пару минут». (SERVER_frontend оказался НЕ нужен — выкинут.)
+РЕЖИМ: ЛЕНИВЫЙ РЕФРЕШ (с 2026-11-13).
+Каждый цикл мост НЕ дёргает API Летая вслепую. Он:
+  1. пробует текущий flussonic-токен лёгким GET плейлиста прямо у медиасервера
+     (kzn-vn-strm40.tattelecom.ru) — это НЕ хрупкий API ЛК;
+  2. если токен жив И go2rtc всё ещё держит стрим → ничего не делает;
+  3. только если поток реально умер (токен протух) или go2rtc потерял стрим —
+     перевыпускает ссылку через API Летая и пушит в go2rtc.
+Так обращений к ломкому API кратно меньше → меньше шансов налететь на их
+очередное изменение, и разовые сбои API не трогают живой поток.
 
-Устойчивость:
-- Точно повторяем браузер (Version, cookie, UA, Referer, два токена).
-- Ретраи с бэкоффом: один 400/таймаут не роняет камеру.
-- Неудачный рефреш НЕ трогает уже живой поток в go2rtc (push только при успехе).
-- 401/419 = протух session_token (Web_long_lived, ~2-3 нед) — ЕДИНСТВЕННОЕ, что
-  требует человека: пишем явный ALERT в лог. Снаружи за этим следит HA-автоматизация
-  «камеры в unavailable → пуш».
+История багов API Летая (почему тут столько «обвязки»):
+- 2026-10: get-live-video требует ДВА РАЗНЫХ одноразовых product-токена
+  (URL ?product_token= ≠ заголовок product-token:).
+- 2026-11-10: требует COOKIE (token=<session_token>; tokenDevice=…).
+- 2026-11-13: требует заголовок `Version: 300`.
+session_token (Web_long_lived) живёт ~2-3 нед, протух → 401/419 → нужен
+ручной перелогин по SMS (автоматизировать нельзя). Ловим и орём в лог.
 """
 
 import json
@@ -36,14 +37,12 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/154.0.0.0 Safari/537.36"
 )
-# Заголовок версии клиента веб-ЛК. Требуется с 2026-11-13. Если снова начнёт
-# отдавать 400 на get-live-video при живом токене — проверить актуальное значение
-# в DevTools (заголовок Version на запросах к newlk.letai.ru) и обновить тут
-# или задать опцию api_version в конфиге аддона.
-API_VERSION = "300"
+API_VERSION = "300"          # заголовок Version, требуется с 2026-11-13
 HTTP_TIMEOUT = 20
-RETRIES = 3          # попыток на камеру за цикл
-RETRY_BACKOFF = 4    # секунд между попытками (растёт линейно)
+PROBE_TIMEOUT = 10           # лёгкая проверка плейлиста у медиасервера
+RETRIES = 3
+RETRY_BACKOFF = 4
+HEARTBEAT_EVERY = 12         # раз в сколько «тихих» циклов писать, что всё живо
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,24 +53,23 @@ log = logging.getLogger("dvor")
 
 
 class AuthExpired(Exception):
-    """session_token протух — нужен ручной перелогин в ЛК."""
+    """session_token протух — нужен ручной перелогин в ЛК по SMS."""
 
 
 def load_options():
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
-        opts = json.load(f)
-    opts["session_token"] = str(opts.get("session_token", "")).strip()
-    opts["account_number"] = str(opts.get("account_number", "")).strip()
-    opts["go2rtc_url"] = str(opts.get("go2rtc_url", "")).strip().rstrip("/")
-    opts["refresh_interval_minutes"] = int(opts.get("refresh_interval_minutes", 15))
-    opts["cameras"] = opts.get("cameras", []) or []
-    opts["cookie"] = str(opts.get("cookie", "") or "").strip()
-    opts["api_version"] = str(opts.get("api_version", "") or API_VERSION).strip()
-    return opts
+        o = json.load(f)
+    o["session_token"] = str(o.get("session_token", "")).strip()
+    o["account_number"] = str(o.get("account_number", "")).strip()
+    o["go2rtc_url"] = str(o.get("go2rtc_url", "")).strip().rstrip("/")
+    o["refresh_interval_minutes"] = int(o.get("refresh_interval_minutes", 5))
+    o["cameras"] = o.get("cameras", []) or []
+    o["cookie"] = str(o.get("cookie", "") or "").strip()
+    o["api_version"] = str(o.get("api_version", "") or API_VERSION).strip()
+    return o
 
 
 def extract_token_device(cookie_raw):
-    """Берём только статический tokenDevice из опции cookie (остальное неважно)."""
     for part in cookie_raw.split(";"):
         part = part.strip()
         if part.startswith("tokenDevice="):
@@ -80,7 +78,6 @@ def extract_token_device(cookie_raw):
 
 
 def build_cookie(opts):
-    """Минимальный рабочий cookie: token (= session_token, URL-encoded) + tokenDevice."""
     jar = {"token": urllib.parse.quote(opts["session_token"], safe="")}
     dev = extract_token_device(opts["cookie"])
     if dev:
@@ -101,8 +98,9 @@ def base_headers(opts):
     }
 
 
+# ---------- API Летая (вызывается ТОЛЬКО когда поток реально надо перевыпустить) ----------
+
 def get_product_token(session, opts):
-    """Один одноразовый product-токен. Сервер выдаёт новый на каждый вызов."""
     r = session.get(
         f"{BASE}/v3/auth/get-product-token",
         params={"account_number": opts["account_number"], "product_code": PRODUCT_CODE},
@@ -110,100 +108,137 @@ def get_product_token(session, opts):
         timeout=HTTP_TIMEOUT,
     )
     if r.status_code in (401, 419):
-        raise AuthExpired(f"get-product-token {r.status_code}: {r.text[:200]}")
+        raise AuthExpired(f"get-product-token {r.status_code}: {r.text[:160]}")
     r.raise_for_status()
     token = (r.json() or {}).get("token")
     if not token:
-        raise RuntimeError(f"empty product_token: {r.text[:200]}")
+        raise RuntimeError(f"empty product_token: {r.text[:160]}")
     return token
 
 
 def get_live_url(session, opts, cam_id):
-    # ДВА РАЗНЫХ одноразовых токена: один в URL, другой в заголовок.
-    t_url = get_product_token(session, opts)
+    t_url = get_product_token(session, opts)   # два РАЗНЫХ одноразовых токена
     t_hdr = get_product_token(session, opts)
-    tries = 0
-    while t_hdr == t_url and tries < 3:
-        t_hdr = get_product_token(session, opts)
-        tries += 1
+    n = 0
+    while t_hdr == t_url and n < 3:
+        t_hdr = get_product_token(session, opts); n += 1
 
     headers = base_headers(opts)
     headers["product-token"] = t_hdr
     headers["Referer"] = f"{BASE}/safe-yard/{cam_id}/{opts['account_number']}"
-
     r = session.get(
         f"{BASE}/v3/safeyard/get-live-video",
         params={"cam_id": cam_id, "product_token": t_url},
-        headers=headers,
-        timeout=HTTP_TIMEOUT,
+        headers=headers, timeout=HTTP_TIMEOUT,
     )
     if r.status_code in (401, 419):
-        raise AuthExpired(f"get-live-video {r.status_code}: {r.text[:200]}")
+        raise AuthExpired(f"get-live-video {r.status_code}: {r.text[:160]}")
     if r.status_code != 200:
-        raise RuntimeError(
-            f"get-live-video {r.status_code}: {r.text[:200]} "
-            f"(ver={opts['api_version']} ptlen={len(t_url)} hdrlen={len(t_hdr)})"
-        )
+        raise RuntimeError(f"get-live-video {r.status_code}: {r.text[:160]} (ver={opts['api_version']})")
     live = (r.json() or {}).get("live")
     if not live:
-        raise RuntimeError(f"no 'live' in response: {r.text[:200]}")
+        raise RuntimeError(f"no 'live' in response: {r.text[:160]}")
     return live
 
 
-def push_to_go2rtc(session, go2rtc_url, stream_name, src_url):
-    r = session.put(
-        f"{go2rtc_url}/api/streams",
-        params={"name": stream_name, "src": src_url},
-        timeout=HTTP_TIMEOUT,
-    )
+# ---------- go2rtc ----------
+
+def push_to_go2rtc(session, go2rtc_url, name, src):
+    r = session.put(f"{go2rtc_url}/api/streams", params={"name": name, "src": src}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
 
-def refresh_camera(session, opts, cam):
-    """Рефреш одной камеры с ретраями. Поднимает AuthExpired наружу (общая причина)."""
-    stream_name = cam["stream_name"]
+def go2rtc_has_stream(session, go2rtc_url, name):
+    try:
+        r = session.get(f"{go2rtc_url}/api/streams", timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return name in (r.json() or {})
+    except Exception as e:  # noqa: BLE001
+        log.warning("go2rtc check failed (%s) — считаю, что стрим надо перепушить", e)
+        return False
+
+
+# ---------- Лёгкая проверка, жив ли flussonic-токен ----------
+
+def probe_stream_alive(session, live_url):
+    """GET плейлиста у медиасервера тем же токеном. True = токен ещё валиден.
+    Строим HLS-плейлист из любой формы live-URL (mpegts/index.m3u8/…)."""
+    try:
+        p = urllib.parse.urlsplit(live_url)
+        token = urllib.parse.parse_qs(p.query).get("token", [""])[0]
+        if not token:
+            return False
+        base_path = p.path.rsplit("/", 1)[0]  # отбрасываем mpegts / index.m3u8
+        probe = urllib.parse.urlunsplit(
+            (p.scheme, p.netloc, f"{base_path}/index.m3u8", f"token={urllib.parse.quote(token)}", "")
+        )
+        r = session.get(probe, headers={"User-Agent": UA, "Referer": BASE + "/"}, timeout=PROBE_TIMEOUT)
+        return r.status_code == 200 and "#EXTM3U" in r.text[:64]
+    except Exception as e:  # noqa: BLE001
+        log.info("probe error (%s) — буду перевыпускать ссылку", e)
+        return False
+
+
+# ---------- Цикл по камере ----------
+
+def ensure_camera(session, opts, cam, last_urls):
+    """Ленивый рефреш одной камеры. Возвращает 'alive' | 'refreshed' | 'failed'.
+    AuthExpired поднимается наружу."""
+    name = cam["stream_name"]
+    live = last_urls.get(name)
+
+    # 1) если знаем ссылку, стрим есть в go2rtc и токен жив — ничего не делаем
+    if live and go2rtc_has_stream(session, opts["go2rtc_url"], name) and probe_stream_alive(session, live):
+        return "alive"
+
+    # 2) иначе — перевыпуск через API Летая (с ретраями)
     last_err = None
     for attempt in range(1, RETRIES + 1):
         try:
-            live = get_live_url(session, opts, cam["cam_id"])
-            push_to_go2rtc(session, opts["go2rtc_url"], stream_name, live)
-            log.info("[%s] refreshed OK", stream_name)
-            return True
+            new_live = get_live_url(session, opts, cam["cam_id"])
+            push_to_go2rtc(session, opts["go2rtc_url"], name, new_live)
+            last_urls[name] = new_live
+            log.info("[%s] refreshed OK", name)
+            return "refreshed"
         except AuthExpired:
-            raise  # не ретраим — токен не починится повтором
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
             if attempt < RETRIES:
                 time.sleep(RETRY_BACKOFF * attempt)
-    # все попытки мимо — поток в go2rtc НЕ трогаем, он мог остаться живым
-    log.error("[%s] failed after %d tries: %s", stream_name, RETRIES, last_err)
-    return False
+    log.error("[%s] refresh failed after %d tries: %s", name, RETRIES, last_err)
+    return "failed"
 
 
 def main():
-    log.info("Starting Tattelecom Dvor Bridge... (API Version=%s)", API_VERSION)
+    log.info("Starting Tattelecom Dvor Bridge... (lazy refresh, Version=%s)", API_VERSION)
     session = requests.Session()
+    last_urls = {}      # stream_name -> последний рабочий live URL (в памяти)
     auth_alerted = False
+    quiet = 0           # счётчик «тихих» циклов для редкого heartbeat
     while True:
-        interval = 15 * 60
+        interval = 5 * 60
         try:
             opts = load_options()
             interval = max(1, opts["refresh_interval_minutes"]) * 60
             try:
-                for cam in opts["cameras"]:
-                    refresh_camera(session, opts, cam)
+                results = [ensure_camera(session, opts, c, last_urls) for c in opts["cameras"]]
                 auth_alerted = False
+                if any(r == "refreshed" or r == "failed" for r in results):
+                    quiet = 0  # было событие — его уже залогировали
+                else:
+                    quiet += 1
+                    if quiet >= HEARTBEAT_EVERY:
+                        log.info("alive: все потоки живы, токены валидны (%d камер)", len(results))
+                        quiet = 0
             except AuthExpired as e:
-                # Единственное, что требует человека. Орём в лог заметно и редко.
                 if not auth_alerted:
                     log.error(
                         "=== SESSION TOKEN EXPIRED (%s). Нужен ручной перелогин в ЛК "
-                        "newlk.letai.ru и обновление опции session_token аддона. "
-                        "Камеры будут жить на старом потоке, пока go2rtc его держит. ===",
-                        e,
-                    )
+                        "newlk.letai.ru по SMS и обновление опции session_token аддона. "
+                        "Пока go2rtc держит старый поток — камеры живут. ===", e)
                     auth_alerted = True
-                interval = 10 * 60  # не долбим сервер протухшим токеном
+                interval = 10 * 60
         except Exception as e:  # noqa: BLE001
             log.error("Cycle failed: %s", e)
         time.sleep(interval)
