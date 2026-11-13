@@ -143,8 +143,19 @@ def get_live_url(session, opts, cam_id):
 
 # ---------- go2rtc ----------
 
-def push_to_go2rtc(session, go2rtc_url, name, src):
-    r = session.put(f"{go2rtc_url}/api/streams", params={"name": name, "src": src}, timeout=HTTP_TIMEOUT)
+def to_go2rtc_src(live_url):
+    """go2rtc давится «сырым» mpegts Летая (`mpegts: wrong adaptation size`),
+    поэтому заворачиваем в ffmpeg: он надёжно демуксит mpegts, видео копируем
+    без перекодирования (H264 → WebRTC/MSE гладко, CPU почти ноль)."""
+    return f"ffmpeg:{live_url}#video=copy"
+
+
+def push_to_go2rtc(session, go2rtc_url, name, live_url):
+    r = session.put(
+        f"{go2rtc_url}/api/streams",
+        params={"name": name, "src": to_go2rtc_src(live_url)},
+        timeout=HTTP_TIMEOUT,
+    )
     r.raise_for_status()
 
 
